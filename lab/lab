@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# lab - drive the real air-gapped k3s practice cluster inside the Codespace.
+#   lab up | down | airgap on|off|status | break <ticket> | chaos | check | reveal | reset | node <cmd> | list
+set -uo pipefail
+
+CLUSTER=lab
+NODE=k3d-${CLUSTER}-server-0
+LAB_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+STATE=/tmp/.lab-state
+SEED_IMAGES=(nginx:1.27-alpine busybox:1.36)
+WORK="$HOME/lab-work"
+
+c_ok() { printf '\033[32m%s\033[0m\n' "$*"; }
+c_info() { printf '\033[36m%s\033[0m\n' "$*"; }
+c_err() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+need_cluster() { kubectl get nodes >/dev/null 2>&1 || { c_err "Cluster isn't running. Run: lab up"; exit 1; }; }
+subnet() { docker network inspect "k3d-${CLUSTER}" -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null; }
+node() { docker exec "$NODE" "$@"; }
+
+wait_docker() {
+  for _ in $(seq 1 60); do docker info >/dev/null 2>&1 && return 0; sleep 2; done
+  c_err "Docker isn't running. Try reloading the Codespace."; exit 1
+}
+
+airgap_on() {
+  local sn; sn=$(subnet); [ -n "$sn" ] || { c_err "No k3d network yet. Run: lab up"; return 1; }
+  sudo iptables -C DOCKER-USER -s "$sn" ! -d "$sn" -j REJECT 2>/dev/null || sudo iptables -I DOCKER-USER -s "$sn" ! -d "$sn" -j REJECT
+  sudo iptables -C DOCKER-USER -s "$sn" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null || sudo iptables -I DOCKER-USER -s "$sn" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  c_ok "Air gap ON: the cluster can't reach anything outside its own network ($sn)."
+}
+airgap_off() {
+  local sn; sn=$(subnet); [ -n "$sn" ] || return 0
+  while sudo iptables -D DOCKER-USER -s "$sn" ! -d "$sn" -j REJECT 2>/dev/null; do :; done
+  while sudo iptables -D DOCKER-USER -s "$sn" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null; do :; done
+  c_info "Air gap OFF: the cluster can reach the internet."
+}
+airgap_status() {
+  local sn; sn=$(subnet)
+  if sudo iptables -C DOCKER-USER -s "$sn" ! -d "$sn" -j REJECT 2>/dev/null; then c_ok "Air gap rule is in place."; else c_info "Air gap rule is NOT in place."; fi
+  echo "Testing a pull from inside the node (should fail when air-gapped)..."
+  if timeout 25 docker exec "$NODE" crictl pull docker.io/library/alpine:3.20 >/dev/null 2>&1; then c_err "Pull succeeded: the node can reach Docker Hub."; else c_ok "Pull failed: the node is air-gapped."; fi
+}
+
+baseline() {
+  kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl -n app get deploy web >/dev/null 2>&1 || kubectl -n app create deployment web --image=nginx:1.27-alpine >/dev/null
+  kubectl -n app get svc web >/dev/null 2>&1 || kubectl -n app expose deployment web --port 80 >/dev/null
+  kubectl -n app get pod client >/dev/null 2>&1 || kubectl -n app run client --image=busybox:1.36 --restart=Never -- sleep 1d >/dev/null
+  kubectl -n app wait --for=condition=Available deploy/web --timeout=120s >/dev/null 2>&1
+  kubectl -n app wait --for=condition=Ready pod/client --timeout=120s >/dev/null 2>&1
+}
+
+up() {
+  wait_docker
+  if k3d cluster list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$CLUSTER"; then
+    c_info "Starting existing cluster..."; k3d cluster start "$CLUSTER" >/dev/null
+  else
+    c_info "Creating the cluster (first time takes a few minutes)..."
+    k3d cluster create "$CLUSTER" --servers 1 --agents 0 --no-lb --k3s-arg "--disable=traefik@server:*" --wait --timeout 300s
+  fi
+  kubectl config use-context "k3d-${CLUSTER}" >/dev/null
+  kubectl wait --for=condition=Ready node --all --timeout=180s >/dev/null
+  kubectl -n kube-system rollout status deploy/coredns --timeout=180s >/dev/null 2>&1
+  # seed the only images this "customer site" will ever have
+  for img in "${SEED_IMAGES[@]}"; do docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null; done
+  k3d image import "${SEED_IMAGES[@]}" -c "$CLUSTER" >/dev/null 2>&1
+  # the vendor's offline bundle, sitting on the node
+  if [ -f "$WORK/offline-bundle/nginx_1.25-alpine.tar" ]; then
+    node mkdir -p /opt/offline-bundle
+    docker cp "$WORK/offline-bundle/." "$NODE:/opt/offline-bundle/" >/dev/null
+  fi
+  baseline
+  airgap_on
+  c_ok "Lab is up. Try: kubectl -n app get pods   |   lab list"
+}
+
+cleanup() {
+  kubectl -n app delete deploy reporter helper --ignore-not-found >/dev/null 2>&1
+  kubectl -n app delete pod report-worker --ignore-not-found --now >/dev/null 2>&1
+  kubectl -n app delete networkpolicy --all >/dev/null 2>&1
+  kubectl -n app set image deploy/web nginx=nginx:1.27-alpine >/dev/null 2>&1
+  kubectl -n app patch svc web -p '{"spec":{"selector":{"app":"web"}}}' >/dev/null 2>&1
+  kubectl -n app scale deploy/web --replicas=1 >/dev/null 2>&1
+  kubectl -n kube-system scale deploy coredns --replicas=1 >/dev/null 2>&1
+  node crictl rmi docker.io/library/nginx:1.25-alpine >/dev/null 2>&1
+  pkill -f "openssl s_server" 2>/dev/null
+  sudo iptables -D INPUT -i lo -p tcp --dport 9444 -j DROP 2>/dev/null
+  rm -f "$STATE"
+}
+
+reset() {
+  need_cluster
+  c_info "Resetting to a clean, healthy state..."
+  cleanup
+  baseline
+  kubectl -n kube-system rollout status deploy/coredns --timeout=120s >/dev/null 2>&1
+  c_ok "Clean. Everything in namespace app is healthy again."
+}
+
+tls_server() {
+  mkdir -p "$WORK/pki" && cd "$WORK/pki" || return 1
+  if [ ! -f srv.crt ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Customer Internal CA" 2>/dev/null
+    openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr -subj "/CN=portal.customer.lab" 2>/dev/null
+    printf "subjectAltName=DNS:portal-old.customer.lab\n" > san.ext
+    openssl x509 -req -in srv.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out srv.crt -days 1 -extfile san.ext 2>/dev/null
+  fi
+  grep -q "portal.customer.lab" /etc/hosts || echo "127.0.0.1 portal.customer.lab" | sudo tee -a /etc/hosts >/dev/null
+  pgrep -f "s_server -accept 8443" >/dev/null || (nohup openssl s_server -accept 8443 -cert srv.crt -key srv.key -www -quiet >/dev/null 2>&1 &)
+  sleep 1
+}
+
+do_break() {
+  local t=${1:-}
+  case "$t" in
+    101)
+      need_cluster; cleanup
+      kubectl -n app create deployment reporter --image=nginx:1.25-alpine >/dev/null
+      kubectl -n app create deployment helper --image=busybox -- sleep 1d >/dev/null
+      c_ok "Ticket 101 is live. Customer: 'reporter and helper are stuck, we can't download anything.'"
+      echo "The vendor's offline bundle is on the node:  lab node ls /opt/offline-bundle"
+      echo "Run node commands with:                      lab node <command>   (e.g. lab node crictl images)" ;;
+    102)
+      need_cluster; cleanup
+      kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: hardening-baseline, namespace: app}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - podSelector: {}
+EOF
+      c_ok "Ticket 102 is live. Customer: 'frontend can't reach web, all pods are Running, nothing changed.'" ;;
+    103)
+      need_cluster; cleanup
+      kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: report-worker, namespace: app}
+spec:
+  containers:
+  - name: worker
+    image: busybox:1.36
+    command: ["sh","-c","echo starting; sleep 5; tail /dev/zero"]
+    resources: {limits: {memory: "48Mi"}}
+EOF
+      c_ok "Ticket 103 is live. Give it a minute or two to crash a few times."
+      echo "Kernel log on the node: lab node dmesg | grep -i oom   (may need: docker exec -it $NODE sh)" ;;
+    104)
+      c_info "Ticket 104 is browser-only. Filling the disk for real would take the Codespace down too." ;;
+    201)
+      tls_server
+      c_ok "Ticket 201 is live. Files are in $WORK/pki"
+      echo "  cd $WORK/pki && curl https://portal.customer.lab:8443" ;;
+    202)
+      tls_server
+      pkill -f "s_server -accept 9444" 2>/dev/null
+      (cd "$WORK/pki" && nohup openssl s_server -accept 9444 -cert srv.crt -key srv.key -www -quiet >/dev/null 2>&1 &)
+      sudo iptables -C INPUT -i lo -p tcp --dport 9444 -j DROP 2>/dev/null || sudo iptables -A INPUT -i lo -p tcp --dport 9444 -j DROP
+      sleep 1
+      c_info "Capturing one attempt per site..."
+      sudo timeout 12 tcpdump -i lo -nn -w "$WORK/cases.pcap" 'port 8443 or port 9443 or port 9444' >/dev/null 2>&1 &
+      sleep 2
+      curl -s -m 5 https://portal.customer.lab:8443 >/dev/null 2>&1
+      curl -s -m 5 https://portal.customer.lab:9443 >/dev/null 2>&1
+      curl -s -m 5 https://portal.customer.lab:9444 >/dev/null 2>&1
+      wait
+      sudo chown "$(id -u)" "$WORK/cases.pcap" 2>/dev/null
+      c_ok "Ticket 202 is live. The capture is $WORK/cases.pcap"
+      echo "  tcpdump -nn -r $WORK/cases.pcap      or      tshark -r $WORK/cases.pcap -Y tls" ;;
+    301)
+      mkdir -p "$WORK/case-4419" && cp "$LAB_DIR/data/bundle.jsonl" "$WORK/case-4419/"
+      c_ok "Ticket 301 is live. The bundle is $WORK/case-4419/bundle.jsonl" ;;
+    403|chaos) chaos ;;
+    *) c_err "Unknown ticket '$t'. Try: lab list"; exit 1 ;;
+  esac
+}
+
+chaos() {
+  need_cluster; cleanup
+  local n=$((RANDOM % 4))
+  case $n in
+    0) kubectl -n app set image deploy/web nginx=nginx:1.26-alpine ;;
+    1) kubectl -n app patch svc web -p '{"spec":{"selector":{"app":"web-v2"}}}' ;;
+    2) kubectl -n kube-system scale deploy coredns --replicas=0 ;;
+    3) kubectl apply -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: baseline-egress, namespace: app}
+spec: {podSelector: {}, policyTypes: [Egress], egress: [{to: [{podSelector: {}}]}]}
+EOF
+    ;;
+  esac >/dev/null 2>&1
+  echo "$n" > "$STATE"
+  clear
+  c_ok "Fault injected. Customer: 'Something is wrong with web in namespace app.' Timer starts now."
+  echo "When you think it's fixed: lab check      To give up: lab reveal"
+}
+
+check() {
+  need_cluster
+  local ok=1
+  kubectl -n app exec client -- wget -qO- -T 5 web >/dev/null 2>&1 || { c_err "client can't fetch http://web yet."; ok=0; }
+  kubectl -n app rollout status deploy/web --timeout=5s >/dev/null 2>&1 || { c_err "deploy/web rollout isn't finished."; ok=0; }
+  [ "$ok" = 1 ] && c_ok "Customer update: it works now. Write the case note."
+}
+
+reveal() {
+  local names=("a rollout to an image that isn't on the node" "the service selector no longer matches the pods" "CoreDNS scaled to zero" "an egress policy that blocks DNS")
+  if [ -f "$STATE" ]; then echo "The fault was: ${names[$(cat "$STATE")]}"; else echo "No chaos round running."; fi
+}
+
+list() {
+  cat <<'EOF'
+lab up              create or start the cluster, seed images, turn the air gap on
+lab down            stop the cluster (keeps it for next time)
+lab reset           put everything back to healthy
+lab break 101       images: missing from the bundle, and an untagged :latest
+lab break 102       an egress policy that kills DNS
+lab break 103       a worker that gets OOMKilled
+lab break 201       a portal cert with three problems (files in ~/lab-work/pki)
+lab break 202       three sites, one capture (~/lab-work/cases.pcap)
+lab break 301       the log bundle (~/lab-work/case-4419)
+lab chaos           one random fault, no hints (same as lab break 403)
+lab check           is the customer happy yet?
+lab reveal          what the chaos fault was
+lab airgap on|off|status
+lab node <cmd>      run a command on the k3s node (crictl, ctr, dmesg, df, ls ...)
+EOF
+}
+
+case "${1:-list}" in
+  up) up ;;
+  down) airgap_off; k3d cluster stop "$CLUSTER" ;;
+  reset) reset ;;
+  break) do_break "${2:-}" ;;
+  chaos) chaos ;;
+  check) check ;;
+  reveal) reveal ;;
+  airgap) case "${2:-status}" in on) airgap_on ;; off) airgap_off ;; *) airgap_status ;; esac ;;
+  node) shift; node "$@" ;;
+  list | help | -h | --help) list ;;
+  *) c_err "Unknown command '$1'"; list; exit 1 ;;
+esac
